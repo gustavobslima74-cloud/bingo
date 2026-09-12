@@ -942,18 +942,50 @@ end
 
 makeActionButton(0, 154, "Marcar Tudo", function()
     task.spawn(function()
-        local t, _, m = syncVisibleBalls(false)
-        if t == 0 then log("Sync: sem bolas chamadas") elseif m == 0 then log("Sync: atualizado") end
+        log("Iniciando varredura forçada: marcando TUDO...")
+        scanCards()
+        
+        local totalMarcadas = 0
+        
+        -- Percorre todas as cartelas ativas (de 1 até MAX_CARDS)
+        for index = 1, MAX_CARDS do
+            local cardData = State.Cards[index]
+            if cardData and cardData.Grid then
+                -- Percorre todas as linhas e colunas da grade (padrão 5x5)
+                for col = 1, GRID do
+                    for row = 1, GRID do
+                        -- Ignora o espaço livre central (Free)
+                        if not isFreeCoordinate(col, row) then
+                            local cell = getCell(cardData, col, row)
+                            if cell and cell:IsA("GuiButton") then
+                                -- Verifica se já está marcado visualmente
+                                if not stampLooksMarked(cell) then
+                                    local ok = pcall(function()
+                                        if type(firesignal) == "function" then
+                                            firesignal(cell.Activated)
+                                        else
+                                            cell:Activate()
+                                        end
+                                    end)
+                                    
+                                    if ok then
+                                        totalMarcadas += 1
+                                        -- Pequeno respiro em milissegundos para o jogo registrar sem crashar/travar
+                                        task.wait(0.015)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        
+        log(string.format("Varredura concluída: %d células clicadas!", totalMarcadas))
+        -- Tenta checar o bingo logo após forçar tudo
+        tryAutoClaim("force-mark-all")
     end)
 end, THEME.Purple)
-
-makeActionButton(162, 154, "Reescanear", function()
-    task.spawn(function()
-        scanCards()
-        local _, _, m = syncVisibleBalls(true)
-        log(m > 0 and ("Reescanear: " .. m .. " marcadas") or "Reescanear: atualizado")
-    end)
-end, THEME.Cyan)
 
 -- Log
 local logPanel = Instance.new("Frame")
