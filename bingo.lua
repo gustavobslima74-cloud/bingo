@@ -49,7 +49,6 @@ local RoundState = BingoRemotes:WaitForChild("RoundState")
 local CardsAssigned = BingoRemotes:WaitForChild("CardsAssigned")
 local ClaimBingo = BingoRemotes:WaitForChild("ClaimBingo")
 
--- Tenta achar remote alternativo para equipar/mudar quantidade de cartelas se houver
 local SetCardsRemote = BingoRemotes:FindFirstChild("SetCards") or BingoRemotes:FindFirstChild("UpdateCards") or BingoRemotes:FindFirstChild("RequestCards")
 
 -- ============================================================
@@ -71,7 +70,8 @@ local State = {
     Running = true,
     AutoDaub = true,
     AutoClaim = true,
-    TargetCardCount = 6, -- Quantidade desejada de cartelas para equipar
+    TargetCardCount = 6,
+    AlreadyWonThisRound = false, -- Trava para contar apenas 1 vez por rodada
     Logs = {},
     Connections = {},
     Gui = nil,
@@ -197,7 +197,9 @@ local function scanCards()
     local numberIndex = {}
 
     if cardArea then
-        for _, object in ipairs(cardArea:GetDescendants()) do
+        local descendants = cardArea:GetDescendants()
+        for i = 1, #descendants do
+            local object = descendants[i]
             local index = cardIndexFromName(object.Name)
             if index then
                 local grid = getCardGrid(object)
@@ -279,13 +281,19 @@ local function requestClaim()
     State.LastClaimAt = os.clock()
     local ok, err = pcall(function() ClaimBingo:FireServer() end)
     if not ok then log("Erro ao chamar bingo: " + tostring(err)); return false end
-    State.Stats.ClaimsTriggered += 1
-    log("BINGO CHAMADO! (Cartela Win)")
+    
+    -- Conta apenas uma vez por rodada para evitar o spam
+    if not State.AlreadyWonThisRound then
+        State.AlreadyWonThisRound = true
+        State.Stats.ClaimsTriggered += 1
+        log("BINGO CHAMADO E COMPUTADO COM SUCESSO!")
+    end
+    
     return true
 end
 
 local function tryAutoClaim(reason)
-    if not State.AutoClaim or not State.Running then return false end
+    if not State.AutoClaim or not State.Running or State.AlreadyWonThisRound then return false end
     local phase = tostring(Workspace:GetAttribute("BingoPhase") or ""):lower()
     if phase ~= "playing" and phase ~= "claimwindow" then return false end
 
@@ -359,8 +367,8 @@ local function markNumberNative(number)
     local matches = State.NumberIndex[num]
     if not matches then return 0 end
     local marked = 0
-    for _, entry in ipairs(matches) do
-        if markEntryNative(entry, num) then marked += 1 end
+    for i = 1, #matches do
+        if markEntryNative(matches[i], num) then marked += 1 end
     end
     return marked
 end
@@ -369,7 +377,9 @@ local function getVisibleCalledNumbers()
     local slots = getBallSlots()
     if not slots then return {} end
     local found = {}
-    for _, obj in ipairs(slots:GetChildren()) do
+    local children = slots:GetChildren()
+    for i = 1, #children do
+        local obj = children[i]
         local number = normalizeNumber(obj.Name)
         if not number then
             local nLbl = obj:FindFirstChild("NumberLabel", true)
@@ -388,14 +398,16 @@ local function syncVisibleBalls(silent)
     if #numbers == 0 then return 0, 0, 0 end
     scanCards()
     local matches, marks = 0, 0
-    for _, number in ipairs(numbers) do
+    for i = 1, #numbers do
         if not State.Running then break end
+        local number = numbers[i]
         State.CalledNumbers[number] = true
         local nMatches = State.NumberIndex[number]
         if nMatches and #nMatches > 0 then
             matches += 1
-            for _, entry in ipairs(nMatches) do
+            for j = 1, #nMatches do
                 if not State.Running then break end
+                local entry = nMatches[j]
                 local cell = entry.Cell or getCell(entry.CardData, entry.Column, entry.Row)
                 if cell and not stampLooksMarked(cell) then
                     if markEntryNative(entry, number) then
@@ -412,37 +424,22 @@ local function syncVisibleBalls(silent)
     return #numbers, matches, marks
 end
 
--- Função para equipar a quantidade de cartelas selecionada
 local function equipCards(amount)
     amount = math.clamp(tonumber(amount) or 1, 1, MAX_CARDS)
     State.TargetCardCount = amount
     
     local success = false
-    
-    -- Tenta disparar por Remote se existir
     if SetCardsRemote then
         local ok = pcall(function() SetCardsRemote:FireServer(amount) end)
         if ok then success = true end
     end
     
-    -- Tenta via Eventos comuns alternativos no ReplicatedStorage se houver
     if not success then
-        for _, remote in ipairs(BingoRemotes:GetChildren()) do
+        local remotes = BingoRemotes:GetChildren()
+        for i = 1, #remotes do
+            local remote = remotes[i]
             if remote:IsA("RemoteEvent") and (remote.Name:lower():find("card") or remote.Name:lower():find("setting")) then
                 pcall(function() remote:FireServer(amount) end)
-            end
-        end
-    end
-    
-    -- Tenta disparar eventos de clique na UI nativa do jogo se estiver aberta (botões de + / - de cartelas)
-    local gui = getBingoGui()
-    if gui then
-        for _, btn in ipairs(gui:GetDescendants()) do
-            if btn:IsA("TextButton") or btn:IsA("ImageButton") then
-                local text = (btn.Name .. " " .. (btn:FindFirstChild("TextLabel") and btn.Text or "")):lower()
-                if text:match("plus") or text:match("add") or text:match("+") then
-                    -- Simula cliques para ajustar se necessário
-                end
             end
         end
     end
@@ -460,6 +457,7 @@ local function clearRoundState(reason)
     table.clear(State.PendingMarks)
     State.LastCalledNumber = nil
     State.LastWinningCard = nil
+    State.AlreadyWonThisRound = false -- Reseta a trava para a nova fase/rodada
     log("Rodada reiniciada")
     task.delay(0.2, function()
         if State.Running then scanCards(); syncVisibleBalls(true) end
@@ -521,7 +519,7 @@ end
 -- GUI
 -- ============================================================
 local BASE_W = 340
-local BASE_H = 610 -- Aumentado para acomodar o painel de equipar cartelas
+local BASE_H = 610
 local HEADER_H = 60
 local isTouch = UserInputService.TouchEnabled
 local minimized = false
@@ -738,9 +736,11 @@ local _, chipMarcadas = makeChip(0, 118, "MARCADAS")
 local _, chipClaims = makeChip(108, 118, "CLAIMS")
 local _, chipFase = makeChip(216, 118, "FASE")
 
--- Painel Equipar Cartelas Direto
+-- ============================================================
+-- PAINEL SLIDER DE CARTELAS
+-- ============================================================
 local cardEquipPanel = Instance.new("Frame")
-cardEquipPanel.Size = UDim2.new(1, 0, 0, 44)
+cardEquipPanel.Size = UDim2.new(1, 0, 0, 52)
 cardEquipPanel.Position = UDim2.fromOffset(0, 168)
 cardEquipPanel.BackgroundColor3 = THEME.Surface
 cardEquipPanel.BorderSizePixel = 0
@@ -748,60 +748,93 @@ cardEquipPanel.Parent = content
 addCorner(cardEquipPanel, 10)
 addStroke(cardEquipPanel, THEME.Border, 0.5)
 
-makeLabel(cardEquipPanel, "QTD CARTELAS:", UDim2.new(0, 85, 1, 0), UDim2.fromOffset(10, 0), Enum.Font.GothamBold, 9, THEME.TextDim)
+makeLabel(cardEquipPanel, "CARTELAS:", UDim2.new(0, 70, 0, 20), UDim2.fromOffset(10, 6), Enum.Font.GothamBold, 9, THEME.TextDim)
+local sliderValueLabel = makeLabel(cardEquipPanel, "6", UDim2.new(0, 30, 0, 20), UDim2.fromOffset(80, 6), Enum.Font.GothamBold, 11, THEME.Purple)
 
--- Input Box para digitar a quantidade de cartelas
-local cardInputBox = Instance.new("TextBox")
-cardInputBox.Size = UDim2.fromOffset(40, 26)
-cardInputBox.Position = UDim2.fromOffset(95, 9)
-cardInputBox.BackgroundColor3 = THEME.Bg
-cardInputBox.BorderSizePixel = 0
-cardInputBox.Font = Enum.Font.GothamBold
-cardInputBox.Text = tostring(State.TargetCardCount)
-cardInputBox.TextSize = 12
-cardInputBox.TextColor3 = THEME.Text
-cardInputBox.ClearTextOnFocus = false
-cardInputBox.Parent = cardEquipPanel
-addCorner(cardInputBox, 6)
-addStroke(cardInputBox, THEME.Border, 0.3)
+-- Slider customizado moderno
+local sliderTrack = Instance.new("Frame")
+sliderTrack.Size = UDim2.new(1, -95, 0, 6)
+sliderTrack.Position = UDim2.fromOffset(10, 34)
+sliderTrack.BackgroundColor3 = THEME.Bg
+sliderTrack.BorderSizePixel = 0
+sliderTrack.Parent = cardEquipPanel
+addCorner(sliderTrack, 3)
 
-connect(cardInputBox.FocusLost, function()
-    local val = tonumber(cardInputBox.Text)
-    if val then
-        State.TargetCardCount = math.clamp(val, 1, MAX_CARDS)
-        cardInputBox.Text = tostring(State.TargetCardCount)
-    else
-        cardInputBox.Text = tostring(State.TargetCardCount)
-    end
-end)
+local sliderFill = Instance.new("Frame")
+sliderFill.Size = UDim2.new(1, 0, 1, 0)
+sliderFill.BackgroundColor3 = THEME.Purple
+sliderFill.BorderSizePixel = 0
+sliderFill.Parent = sliderTrack
+addCorner(sliderFill, 3)
 
--- Botão de Equipar Cartelas
+local sliderThumb = Instance.new("Frame")
+sliderThumb.Size = UDim2.fromOffset(14, 14)
+sliderThumb.AnchorPoint = Vector2.new(0.5, 0.5)
+sliderThumb.Position = UDim2.new(1, 0, 0.5, 0)
+sliderThumb.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+sliderThumb.BorderSizePixel = 0
+sliderThumb.Parent = sliderTrack
+addCorner(sliderThumb, 7)
+addStroke(sliderThumb, THEME.Pink, 0.2, 1.5)
+
+-- Botão Equipar ao lado do slider
 local equipBtn = Instance.new("TextButton")
-equipBtn.Size = UDim2.fromOffset(150, 26)
-equipBtn.Position = UDim2.new(1, -160, 0, 9)
+equipBtn.Size = UDim2.fromOffset(75, 34)
+equipBtn.Position = UDim2.new(1, -85, 0, 9)
 equipBtn.BackgroundColor3 = THEME.Purple
 equipBtn.BorderSizePixel = 0
 equipBtn.AutoButtonColor = false
 equipBtn.Font = Enum.Font.GothamBold
-equipBtn.Text = "Equipar Cartelas"
+equipBtn.Text = "Equipar"
 equipBtn.TextSize = 10
 equipBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
 equipBtn.Parent = cardEquipPanel
-addCorner(equipBtn, 6)
+addCorner(equipBtn, 8)
 addStroke(equipBtn, THEME.Pink, 0.3)
 
 connect(equipBtn.MouseEnter, function() equipBtn.BackgroundColor3 = THEME.Pink end)
 connect(equipBtn.MouseLeave, function() equipBtn.BackgroundColor3 = THEME.Purple end)
 connect(equipBtn.Activated, function()
-    local val = tonumber(cardInputBox.Text) or State.TargetCardCount
-    equipCards(val)
+    equipCards(State.TargetCardCount)
+end)
+
+-- Lógica do Slider Drag
+local sliderDragging = false
+local function updateSliderFromInput(inputPos)
+    local absolutePos = sliderTrack.AbsolutePosition.X
+    local absoluteSize = sliderTrack.AbsoluteSize.X
+    if absoluteSize <= 0 then return end
+    local relX = math.clamp((inputPos - absolutePos) / absoluteSize, 0, 1)
+    local val = math.clamp(math.floor(relX * (MAX_CARDS - 1) + 0.5) + 1, 1, MAX_CARDS)
+    
+    State.TargetCardCount = val
+    sliderValueLabel.Text = tostring(val)
+    sliderFill.Size = UDim2.new((val - 1) / (MAX_CARDS - 1), 0, 1, 0)
+    sliderThumb.Position = UDim2.new((val - 1) / (MAX_CARDS - 1), 0, 0.5, 0)
+end
+
+connect(sliderTrack.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = true
+        updateSliderFromInput(input.Position.X)
+    end
+end)
+connect(UserInputService.InputChanged, function(input)
+    if sliderDragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        updateSliderFromInput(input.Position.X)
+    end
+end)
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        sliderDragging = false
+    end
 end)
 
 -- Progresso
-makeLabel(content, "PROGRESSO DE MARCACAO", UDim2.new(1, 0, 0, 12), UDim2.fromOffset(2, 220), Enum.Font.GothamBold, 8, THEME.TextDim)
+makeLabel(content, "PROGRESSO DE MARCACAO", UDim2.new(1, 0, 0, 12), UDim2.fromOffset(2, 226), Enum.Font.GothamBold, 8, THEME.TextDim)
 local progressBar = Instance.new("Frame")
 progressBar.Size = UDim2.new(1, 0, 0, 7)
-progressBar.Position = UDim2.fromOffset(0, 235)
+progressBar.Position = UDim2.fromOffset(0, 241)
 progressBar.BackgroundColor3 = THEME.Surface
 progressBar.BorderSizePixel = 0
 progressBar.Parent = content
@@ -822,7 +855,7 @@ fillGradient.Color = ColorSequence.new({
 })
 fillGradient.Parent = progressFill
 
-local progressText = makeLabel(content, "0 marcacoes enviadas", UDim2.new(1, 0, 0, 12), UDim2.fromOffset(2, 246), Enum.Font.Gotham, 9, THEME.TextDim)
+local progressText = makeLabel(content, "0 marcacoes enviadas", UDim2.new(1, 0, 0, 12), UDim2.fromOffset(2, 252), Enum.Font.Gotham, 9, THEME.TextDim)
 
 -- Toggles (Pilulas)
 local function makePill(y, labelText, initialOn, onChange)
@@ -874,13 +907,13 @@ local function makePill(y, labelText, initialOn, onChange)
     return pill, refresh
 end
 
-makePill(268, "MARCACAO AUTOMATICA", State.AutoDaub, function(on)
+makePill(274, "MARCACAO AUTOMATICA", State.AutoDaub, function(on)
     State.AutoDaub = on
     if on then task.spawn(function() if State.Running then scanCards(); syncVisibleBalls(true) end end) end
     log(on and "Marcacao ativada" or "Marcacao desativada")
 end)
 
-makePill(314, "BINGO AUTOMATICO", State.AutoClaim, function(on)
+makePill(320, "BINGO AUTOMATICO", State.AutoClaim, function(on)
     State.AutoClaim = on
     if on then task.defer(function() if State.Running then scanCards(); tryAutoClaim("reenabled") end end) end
     log(on and "Bingo automatico ativado" or "Bingo automatico desativado")
@@ -890,7 +923,7 @@ end)
 local function makeActionButton(x, w, text, callback, accent)
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.fromOffset(w, 32)
-    btn.Position = UDim2.fromOffset(x, 364)
+    btn.Position = UDim2.fromOffset(x, 370)
     btn.BackgroundColor3 = THEME.Surface2
     btn.BorderSizePixel = 0
     btn.AutoButtonColor = false
@@ -925,7 +958,7 @@ end, THEME.Cyan)
 -- Log
 local logPanel = Instance.new("Frame")
 logPanel.Size = UDim2.new(1, 0, 0, 150)
-logPanel.Position = UDim2.fromOffset(0, 406)
+logPanel.Position = UDim2.fromOffset(0, 412)
 logPanel.BackgroundColor3 = THEME.Surface
 logPanel.BorderSizePixel = 0
 logPanel.Parent = content
@@ -1060,7 +1093,7 @@ connect(minimize.Activated, function()
 end)
 
 -- ============================================================
--- FUNÇÃO DE UPDATE DA UI E EVENTOS
+-- ATUALIZAÇÃO DA UI E EVENTOS
 -- ============================================================
 local function updateUi()
     if not State.Running or not ui.Parent then return end
@@ -1103,7 +1136,9 @@ local function updateUi()
 end
 
 local function extractNumber(...)
-    for _, arg in ipairs(table.pack(...)) do
+    local pack = table.pack(...)
+    for i = 1, pack.n do
+        local arg = pack[i]
         local n = normalizeNumber(arg)
         if n then return n end
         if type(arg) == "table" then
@@ -1144,7 +1179,9 @@ connect(CardsAssigned.OnClientEvent, function()
 end)
 
 connect(RoundState.OnClientEvent, function(...)
-    for _, payload in ipairs(table.pack(...)) do
+    local pack = table.pack(...)
+    for i = 1, pack.n do
+        local payload = pack[i]
         if type(payload) == "table" and payload.pattern and tostring(payload.pattern) ~= "" then
             State.ActivePattern = tostring(payload.pattern)
             break
@@ -1183,7 +1220,7 @@ function State:Destroy()
     if not self.Running then return end
     self.Running = false
     table.clear(self.PendingMarks)
-    for _, c in ipairs(self.Connections) do pcall(function() c:Disconnect() end) end
+    for i = 1, #self.Connections do pcall(function() self.Connections[i]:Disconnect() end) end
     table.clear(self.Connections)
     if self.Gui then pcall(function() self.Gui:Destroy() end); self.Gui = nil end
     if ENV.KikoMenu == self then ENV.KikoMenu = nil end
